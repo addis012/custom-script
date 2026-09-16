@@ -28,6 +28,16 @@ function cleanPhone(raw) {
   return raw.replace(/^p:/i, '').replace(/\D/g, '');
 }
 
+function parseSentEvents(raw) {
+  const value = (raw || '').trim();
+  if (!value) return new Set();
+  // backward compatibility with the old single-value format
+  if (value === 'lead_sent') return new Set(['Lead']);
+  if (value === 'qualified_sent') return new Set(['Lead', 'Qualified']);
+  // new format: comma-separated list, e.g. "Lead,Qualified,Converted"
+  return new Set(value.split(',').map((s) => s.trim()).filter(Boolean));
+}
+
 function colIndexToLetter(index) {
   let letter = '';
   let n = index;
@@ -149,8 +159,7 @@ async function run() {
     console.log(`Added tracking column '${SYNC_COLUMN_HEADER}' at column ${letter}`);
   }
 
-  let leadsSent = 0;
-  let qualifiedSent = 0;
+  const counts = { Lead: 0, Qualified: 0, Converted: 0 };
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
@@ -158,48 +167,58 @@ async function run() {
     const fullName = row[colIndex.full_name];
     const phoneNumber = row[colIndex.phone_number];
     const leadStatus = row[colIndex.lead_status];
-    const syncStatus = (row[syncColIndex] || '').trim();
+    const sentEvents = parseSentEvents(row[syncColIndex]);
+    const statusLower = (leadStatus || '').trim().toLowerCase();
 
     if (!email && !phoneNumber) continue; // nothing to identify this lead by
-    if (syncStatus === 'qualified_sent') continue; // already fully processed
+    if (sentEvents.has('Converted')) continue; // fully processed, end of funnel
 
     const lead = { email, full_name: fullName, phone_number: phoneNumber, lead_status: leadStatus };
     const rowNumber = i + 1;
     const syncCellRange = `${GOOGLE_SHEET_NAME}!${colIndexToLetter(syncColIndex)}${rowNumber}`;
+    let changed = false;
 
     try {
-      if (!syncStatus) {
+      if (!sentEvents.has('Lead')) {
         await sendMetaEvent('Lead', lead);
-        leadsSent++;
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: GOOGLE_SPREADSHEET_ID,
-          range: syncCellRange,
-          valueInputOption: 'RAW',
-          requestBody: { values: [['lead_sent']] }
-        });
+        sentEvents.add('Lead');
+        counts.Lead++;
+        changed = true;
         console.log(`Row ${rowNumber}: sent Lead event`);
       }
 
-      if (
-        (syncStatus === 'lead_sent' || !syncStatus) &&
-        (leadStatus || '').trim().toLowerCase() === 'qualified'
-      ) {
+      if (statusLower === 'qualified' && !sentEvents.has('Qualified')) {
         await sendMetaEvent('QualifiedLead', lead);
-        qualifiedSent++;
+        sentEvents.add('Qualified');
+        counts.Qualified++;
+        changed = true;
+        console.log(`Row ${rowNumber}: sent QualifiedLead event`);
+      }
+
+      if (statusLower === 'converted' && !sentEvents.has('Converted')) {
+        await sendMetaEvent('ConvertedLead', lead);
+        sentEvents.add('Converted');
+        counts.Converted++;
+        changed = true;
+        console.log(`Row ${rowNumber}: sent ConvertedLead event`);
+      }
+
+      if (changed) {
         await sheets.spreadsheets.values.update({
           spreadsheetId: GOOGLE_SPREADSHEET_ID,
           range: syncCellRange,
           valueInputOption: 'RAW',
-          requestBody: { values: [['qualified_sent']] }
+          requestBody: { values: [[Array.from(sentEvents).join(',')]] }
         });
-        console.log(`Row ${rowNumber}: sent QualifiedLead event`);
       }
     } catch (err) {
       console.error(`Row ${rowNumber}: failed —`, err.message);
     }
   }
 
-  console.log(`Done. Lead events sent: ${leadsSent}. QualifiedLead events sent: ${qualifiedSent}.`);
+  console.log(
+    `Done. Lead events sent: ${counts.Lead}. QualifiedLead events sent: ${counts.Qualified}. ConvertedLead events sent: ${counts.Converted}.`
+  );
 }
 
 run().catch((err) => {
