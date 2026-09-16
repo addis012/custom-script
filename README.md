@@ -5,8 +5,18 @@ API (dataset `1070481572400054`):
 
 - Sends a **`Lead`** event the first time a row is seen.
 - Sends a **`QualifiedLead`** event once `lead_status` becomes `Qualified`.
+- Sends a **`ConvertedLead`** event once `lead_status` becomes `Converted`.
 - Tracks progress in a `meta_sync_status` column it adds to the sheet, so
-  re-running the script never double-sends the same event.
+  re-running the script never double-sends the same event. This tracking is
+  order-independent — a lead that jumps straight from `Lead` to `Converted`
+  (skipping `Qualified`) will still correctly get its `Lead` and
+  `ConvertedLead` events, without ever getting a `QualifiedLead` event it
+  never earned.
+- Other statuses in your pipeline (`CREATED`, `Contacted`, `Schedule`,
+  `Lost`) are not sent to Meta as separate events — they're mainly useful for
+  your own internal tracking rather than ad optimization signal. `Lost` in
+  particular has no meaningful "negative conversion" event in Meta's system,
+  so it's intentionally left out.
 
 ## 1. Set up the Google Sheets connection
 
