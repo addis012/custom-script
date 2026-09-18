@@ -1,22 +1,26 @@
 # Meta CAPI Sheet Sync
 
-Reads leads from the `temer crm` Google Sheet and sends them to Meta Conversions
-API (dataset `1070481572400054`):
+Reads leads from the `temer crm` Google Sheet and sends CRM stage updates to
+Meta's **Conversion Leads** integration (dataset `1070481572400054`) — the
+format Meta requires for optimizing native Facebook/Instagram Lead Ads
+(Instant Forms) toward lead quality, not just form fills.
 
-- Sends a **`Lead`** event the first time a row is seen.
-- Sends a **`QualifiedLead`** event once `lead_status` becomes `Qualified`.
-- Sends a **`ConvertedLead`** event once `lead_status` becomes `Converted`.
-- Tracks progress in a `meta_sync_status` column it adds to the sheet, so
-  re-running the script never double-sends the same event. This tracking is
-  order-independent — a lead that jumps straight from `Lead` to `Converted`
-  (skipping `Qualified`) will still correctly get its `Lead` and
-  `ConvertedLead` events, without ever getting a `QualifiedLead` event it
-  never earned.
-- Other statuses in your pipeline (`CREATED`, `Contacted`, `Schedule`,
-  `Lost`) are not sent to Meta as separate events — they're mainly useful for
-  your own internal tracking rather than ad optimization signal. `Lost` in
-  particular has no meaningful "negative conversion" event in Meta's system,
-  so it's intentionally left out.
+- Every time a lead's `lead_status` changes to a value that hasn't been sent
+  yet (`CREATED`, `Contacted`, `Qualified`, `Converted`, `Lost`, `Schedule`,
+  or any other stage text your CRM uses), an event is sent with
+  `event_name` set to that exact stage text.
+- Each event is matched to the original Facebook lead using the sheet's
+  `id` column (Facebook's `lead_id`) — this is a precise match, unlike
+  email/phone matching alone, and is what allows Meta to actually optimize
+  Lead Ad delivery toward people likely to convert.
+- Hashed email, phone, and name are also included alongside `lead_id` to
+  further improve event match quality.
+- Every event includes `event_source: "crm"` and `lead_event_source` (your
+  CRM's name, configurable via `LEAD_EVENT_SOURCE`), as Meta's integration
+  requires.
+- Tracks progress in a `meta_sync_status` column (a comma-separated list of
+  stage names already sent for that row), so re-running the script never
+  double-sends the same stage — regardless of what order stages occur in.
 
 ## 1. Set up the Google Sheets connection
 
@@ -58,6 +62,8 @@ META_TEST_EVENT_CODE=                  # optional, only for testing
 The script looks these up **by header name** (case-insensitive), regardless of
 which columns they're in:
 
+- `id` — Facebook's lead_id (e.g. `l:1762216354822730` — the `l:` prefix is
+  stripped automatically before sending)
 - `email`
 - `full_name`
 - `phone_number`
