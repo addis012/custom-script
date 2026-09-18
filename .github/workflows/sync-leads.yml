@@ -25,3 +25,4 @@ jobs:
           GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
           META_DATASET_ID: ${{ secrets.META_DATASET_ID }}
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          LEAD_EVENT_SOURCE: ${{ secrets.LEAD_EVENT_SOURCE }}
