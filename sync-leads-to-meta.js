@@ -9,11 +9,14 @@ const {
   GOOGLE_SHEET_NAME,
   META_DATASET_ID,
   META_ACCESS_TOKEN,
-  META_TEST_EVENT_CODE
+  META_TEST_EVENT_CODE,
+  LEAD_EVENT_SOURCE
 } = process.env;
 
 const SYNC_COLUMN_HEADER = 'meta_sync_status';
-const REQUIRED_HEADERS = ['email', 'full_name', 'phone_number', 'lead_status'];
+// "id" is the Facebook lead_id column (e.g. "l:1762216354822730").
+const REQUIRED_HEADERS = ['id', 'email', 'full_name', 'phone_number', 'lead_status'];
+const CRM_NAME = LEAD_EVENT_SOURCE || 'Temer CRM';
 
 // --- helpers -----------------------------------------------------------
 
@@ -23,18 +26,19 @@ function sha256(value) {
 
 function cleanPhone(raw) {
   if (!raw) return '';
-  // strips a leading "p:" prefix (seen in this sheet's export format) and
-  // anything that isn't a digit, leaving digits-only as Meta requires.
   return raw.replace(/^p:/i, '').replace(/\D/g, '');
 }
 
-function parseSentEvents(raw) {
+function cleanLeadId(raw) {
+  if (!raw) return '';
+  // strips a prefix like "l:" that this sheet's export format adds,
+  // leaving Facebook's raw leadgen_id.
+  return raw.replace(/^[a-z]+:/i, '').trim();
+}
+
+function parseSentStages(raw) {
   const value = (raw || '').trim();
   if (!value) return new Set();
-  // backward compatibility with the old single-value format
-  if (value === 'lead_sent') return new Set(['Lead']);
-  if (value === 'qualified_sent') return new Set(['Lead', 'Qualified']);
-  // new format: comma-separated list, e.g. "Lead,Qualified,Converted"
   return new Set(value.split(',').map((s) => s.trim()).filter(Boolean));
 }
 
@@ -59,8 +63,14 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
-async function sendMetaEvent(eventName, lead) {
+// Sends a lead-stage event using Meta's CRM Lead Qualification format.
+// See: Conversion Leads Integration (Conversions API) — requires lead_id,
+// event_source: "crm", and lead_event_source.
+async function sendLeadStageEvent(stageName, lead) {
   const userData = {};
+
+  const leadId = cleanLeadId(lead.id);
+  if (leadId) userData.lead_id = leadId;
   if (lead.email) userData.em = [sha256(lead.email)];
 
   const phone = cleanPhone(lead.phone_number);
@@ -75,12 +85,13 @@ async function sendMetaEvent(eventName, lead) {
   const payload = {
     data: [
       {
-        event_name: eventName,
+        event_name: stageName,
         event_time: Math.floor(Date.now() / 1000),
         action_source: 'system_generated',
         user_data: userData,
         custom_data: {
-          lead_status: lead.lead_status || ''
+          event_source: 'crm',
+          lead_event_source: CRM_NAME
         }
       }
     ],
@@ -104,6 +115,12 @@ async function sendMetaEvent(eventName, lead) {
   if (!response.ok) {
     throw new Error(`Meta CAPI error: ${JSON.stringify(result)}`);
   }
+
+  console.log(`  → Meta response for "${stageName}":`, JSON.stringify(result));
+  if (typeof result.events_received === 'number' && result.events_received === 0) {
+    console.warn(`  ⚠ Meta accepted the request but events_received was 0 for "${stageName}".`);
+  }
+
   return result;
 }
 
@@ -159,66 +176,43 @@ async function run() {
     console.log(`Added tracking column '${SYNC_COLUMN_HEADER}' at column ${letter}`);
   }
 
-  const counts = { Lead: 0, Qualified: 0, Converted: 0 };
+  let stagesSent = 0;
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
+    const id = row[colIndex.id];
     const email = row[colIndex.email];
     const fullName = row[colIndex.full_name];
     const phoneNumber = row[colIndex.phone_number];
-    const leadStatus = row[colIndex.lead_status];
-    const sentEvents = parseSentEvents(row[syncColIndex]);
-    const statusLower = (leadStatus || '').trim().toLowerCase();
+    const leadStatus = (row[colIndex.lead_status] || '').trim();
+    const sentStages = parseSentStages(row[syncColIndex]);
 
-    if (!email && !phoneNumber) continue; // nothing to identify this lead by
-    if (sentEvents.has('Converted')) continue; // fully processed, end of funnel
+    if (!id && !email && !phoneNumber) continue; // nothing to identify this lead by
+    if (!leadStatus) continue; // no stage to report yet
+    if (sentStages.has(leadStatus)) continue; // this exact stage was already sent
 
-    const lead = { email, full_name: fullName, phone_number: phoneNumber, lead_status: leadStatus };
+    const lead = { id, email, full_name: fullName, phone_number: phoneNumber };
     const rowNumber = i + 1;
     const syncCellRange = `${GOOGLE_SHEET_NAME}!${colIndexToLetter(syncColIndex)}${rowNumber}`;
-    let changed = false;
 
     try {
-      if (!sentEvents.has('Lead')) {
-        await sendMetaEvent('Lead', lead);
-        sentEvents.add('Lead');
-        counts.Lead++;
-        changed = true;
-        console.log(`Row ${rowNumber}: sent Lead event`);
-      }
+      await sendLeadStageEvent(leadStatus, lead);
+      sentStages.add(leadStatus);
+      stagesSent++;
+      console.log(`Row ${rowNumber}: sent "${leadStatus}" stage event`);
 
-      if (statusLower === 'qualified' && !sentEvents.has('Qualified')) {
-        await sendMetaEvent('QualifiedLead', lead);
-        sentEvents.add('Qualified');
-        counts.Qualified++;
-        changed = true;
-        console.log(`Row ${rowNumber}: sent QualifiedLead event`);
-      }
-
-      if (statusLower === 'converted' && !sentEvents.has('Converted')) {
-        await sendMetaEvent('ConvertedLead', lead);
-        sentEvents.add('Converted');
-        counts.Converted++;
-        changed = true;
-        console.log(`Row ${rowNumber}: sent ConvertedLead event`);
-      }
-
-      if (changed) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: GOOGLE_SPREADSHEET_ID,
-          range: syncCellRange,
-          valueInputOption: 'RAW',
-          requestBody: { values: [[Array.from(sentEvents).join(',')]] }
-        });
-      }
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: syncCellRange,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[Array.from(sentStages).join(',')]] }
+      });
     } catch (err) {
       console.error(`Row ${rowNumber}: failed —`, err.message);
     }
   }
 
-  console.log(
-    `Done. Lead events sent: ${counts.Lead}. QualifiedLead events sent: ${counts.Qualified}. ConvertedLead events sent: ${counts.Converted}.`
-  );
+  console.log(`Done. Stage events sent: ${stagesSent}.`);
 }
 
 run().catch((err) => {
